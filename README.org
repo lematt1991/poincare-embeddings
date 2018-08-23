@@ -35,6 +35,11 @@ Simply clone this repository via
 - Scikit-Learn
 - NLTK (to generate the WordNet data)
 
+#+BEGIN_SRC sh
+conda env create -f environment.yml
+source activate poincare
+#+END_SRC
+
 ** References
 If you find this code useful for your research, please cite the following paper in your publication:
 #+BEGIN_SRC bibtex
