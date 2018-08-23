@@ -47,10 +47,10 @@ def train(model, data, optimizer, opt, log, rank=1, queue=None):
             elapsed = timeit.default_timer() - t_start
             optimizer.zero_grad()
             preds = model(inputs)
-            loss = model.loss(preds, targets, size_average=True)
+            loss = model.loss(preds, targets)
             loss.backward()
             optimizer.step(lr=lr)
-            epoch_loss.append(loss.data[0])
+            epoch_loss.append(loss.data.item())
         if rank == 1:
             emb = None
             if epoch == (opt.epochs - 1) or epoch % opt.eval_each == (opt.eval_each - 1):

@@ -122,8 +122,8 @@ class SNEmbedding(Embedding):
         dists = self.dist()(s, o).squeeze(-1)
         return -dists
 
-    def loss(self, preds, targets, weight=None, size_average=True):
-        lossfn = self.lossfn(size_average=size_average, weight=weight)
+    def loss(self, preds, targets, weight=None):
+        lossfn = self.lossfn(reduction='elementwise_mean', weight=weight)
         return lossfn(preds, targets)
 
 
@@ -143,8 +143,8 @@ class GraphDataset(Dataset):
         self._counts = np.ones(len(objects), dtype=np.float)
         for i in range(idx.size(0)):
             t, h, w = self.idx[i]
-            self._counts[h] += w
-            self._weights[t][h] += w
+            self._counts[h.item()] += w
+            self._weights[t.item()][h.item()] += w
         self._weights = dict(self._weights)
         nents = int(np.array(list(self._weights.keys())).max() + 1)
         assert len(objects) == nents, 'Number of objects do no match'
@@ -182,7 +182,7 @@ class SNGraphDataset(GraphDataset):
                 n = int(self.unigram_table[n])
             else:
                 n = randint(0, len(self.objects))
-            if n not in self._weights[t]:
+            if n not in self._weights[t.item()]:
                 negs.add(n)
             ntries += 1
         if len(negs) == 0:
