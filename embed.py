@@ -27,7 +27,7 @@ def ranking(types, model, distfn):
         ap_scores = []
         for s, s_types in types.items():
             s_e = embedding[s].expand_as(embedding)
-            _dists = model.dist()(s_e, embedding).data.cpu().numpy().flatten()
+            _dists = model.dist(s_e, embedding).data.cpu().numpy().flatten()
             _dists[s] = 1e+12
             _labels = np.zeros(embedding.size(0))
             _dists_masked = _dists.copy()
@@ -126,19 +126,19 @@ if __name__ == '__main__':
     adjacency = ddict(set)
     for i in range(len(idx)):
         s, o, _ = idx[i]
-        adjacency[s].add(o)
+        adjacency[s.item()].add(o.item())
     adjacency = dict(adjacency)
 
     # setup Riemannian gradients for distances
     opt.retraction = rsgd.euclidean_retraction
     if opt.distfn == 'poincare':
-        distfn = model.PoincareDistance
+        distfn = model.poincare_distance
         opt.rgrad = rsgd.poincare_grad
     elif opt.distfn == 'euclidean':
-        distfn = model.EuclideanDistance
+        distfn = model.EuclideanDistance()
         opt.rgrad = rsgd.euclidean_grad
     elif opt.distfn == 'transe':
-        distfn = model.TranseDistance
+        distfn = model.TranseDistance()
         opt.rgrad = rsgd.euclidean_grad
     else:
         raise ValueError(f'Unknown distance function {opt.distfn}')

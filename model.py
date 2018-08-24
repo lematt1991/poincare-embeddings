@@ -17,51 +17,56 @@ from collections import defaultdict as ddict
 eps = 1e-5
 
 
-class Arcosh(Function):
-    def __init__(self, eps=eps):
-        super(Arcosh, self).__init__()
-        self.eps = eps
+class Acosh(Function):
+    @staticmethod
+    def forward(ctx, x, eps):
+        z = th.sqrt(x * x - 1)
+        ctx.save_for_backward(z)
+        ctx.eps = eps
+        return th.log(x + z)
 
-    def forward(self, x):
-        self.z = th.sqrt(x * x - 1)
-        return th.log(x + self.z)
-
-    def backward(self, g):
-        z = th.clamp(self.z, min=eps)
+    @staticmethod
+    def backward(ctx, g):
+        z, = ctx.saved_tensors
+        z = th.clamp(z, min=ctx.eps)
         z = g / z
-        return z
+        return z, None
 
 
 class PoincareDistance(Function):
     boundary = 1 - eps
-
-    def grad(self, x, v, sqnormx, sqnormv, sqdist):
+    @staticmethod
+    def grad(x, v, sqnormx, sqnormv, sqdist):
         alpha = (1 - sqnormx)
         beta = (1 - sqnormv)
         z = 1 + 2 * sqdist / (alpha * beta)
-        a = ((sqnormv - 2 * th.sum(x * v, dim=-1) + 1) / th.pow(alpha, 2)).unsqueeze(-1).expand_as(x)
+        a = ((sqnormv - 2 * th.sum(x * v, dim=-1) + 1) / th.pow(alpha, 2))\
+            .unsqueeze(-1).expand_as(x)
         a = a * x - v / alpha.unsqueeze(-1).expand_as(v)
         z = th.sqrt(th.pow(z, 2) - 1)
         z = th.clamp(z * beta, min=eps).unsqueeze(-1)
         return 4 * a / z.expand_as(x)
 
-    def forward(self, u, v):
-        self.save_for_backward(u, v)
-        self.squnorm = th.clamp(th.sum(u * u, dim=-1), 0, self.boundary)
-        self.sqvnorm = th.clamp(th.sum(v * v, dim=-1), 0, self.boundary)
-        self.sqdist = th.sum(th.pow(u - v, 2), dim=-1)
-        x = self.sqdist / ((1 - self.squnorm) * (1 - self.sqvnorm)) * 2 + 1
+    @staticmethod
+    def forward(ctx, u, v):
+        squnorm = th.clamp(th.sum(u * u, dim=-1), 0, PoincareDistance.boundary)
+        sqvnorm = th.clamp(th.sum(v * v, dim=-1), 0, PoincareDistance.boundary)
+        sqdist = th.sum(th.pow(u - v, 2), dim=-1)
+        ctx.save_for_backward(u, v, squnorm, sqvnorm, sqdist)
+        x = sqdist / ((1 - squnorm) * (1 - sqvnorm)) * 2 + 1
         # arcosh
         z = th.sqrt(th.pow(x, 2) - 1)
         return th.log(x + z)
 
-    def backward(self, g):
-        u, v = self.saved_tensors
+    @staticmethod
+    def backward(ctx, g):
+        u, v, squnorm, sqvnorm, sqdist = ctx.saved_tensors
         g = g.unsqueeze(-1)
-        gu = self.grad(u, v, self.squnorm, self.sqvnorm, self.sqdist)
-        gv = self.grad(v, u, self.sqvnorm, self.squnorm, self.sqdist)
+        gu = PoincareDistance.grad(u, v, squnorm, sqvnorm, sqdist)
+        gv = PoincareDistance.grad(v, u, sqvnorm, squnorm, sqdist)
         return g.expand_as(gu) * gu, g.expand_as(gv) * gv
 
+poincare_distance = PoincareDistance.apply
 
 class EuclideanDistance(nn.Module):
     def __init__(self, radius=1, dim=None):
@@ -87,7 +92,7 @@ class TranseDistance(nn.Module):
 
 
 class Embedding(nn.Module):
-    def __init__(self, size, dim, dist=PoincareDistance, max_norm=1):
+    def __init__(self, size, dim, dist=poincare_distance, max_norm=1):
         super(Embedding, self).__init__()
         self.dim = dim
         self.lt = nn.Embedding(
@@ -112,14 +117,14 @@ class Embedding(nn.Module):
 
 
 class SNEmbedding(Embedding):
-    def __init__(self, size, dim, dist=PoincareDistance, max_norm=1):
+    def __init__(self, size, dim, dist=poincare_distance, max_norm=1):
         super(SNEmbedding, self).__init__(size, dim, dist, max_norm)
         self.lossfn = nn.CrossEntropyLoss
 
     def _forward(self, e):
         o = e.narrow(1, 1, e.size(1) - 1)
         s = e.narrow(1, 0, 1).expand_as(o)
-        dists = self.dist()(s, o).squeeze(-1)
+        dists = self.dist(s, o).squeeze(-1)
         return -dists
 
     def loss(self, preds, targets, weight=None):
