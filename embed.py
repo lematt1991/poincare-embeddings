@@ -44,6 +44,27 @@ def ranking(types, model, distfn):
             ranks += _ranks
         return np.mean(ranks), np.mean(ap_scores)
 
+def eval_reconstruction(adj, model, distfn):
+    lt = th.from_numpy(model.embedding())
+    objects = np.array(list(adj.keys()))
+    ranksum = nranks = ap_scores = iters = 0
+    labels = np.zeros(lt.size(0))
+    for object, _ in adj.items():
+        labels.fill(0)
+        neighbors = np.array(list(adj[object]))
+        dists = distfn(lt[None, object], lt)
+        dists[object] = 1e+12
+        sorted_dists, sorted_idx = dists.sort()
+        ranks, = np.where(np.in1d(sorted_idx.cpu().numpy(), neighbors))
+        ranks += 1
+        N = ranks.shape[0]
+        ranksum += ranks.sum() - (N * (N - 1) / 2)
+        nranks += ranks.shape[0]
+        labels[neighbors] = 1
+        ap_scores += average_precision_score(labels, -dists.cpu().numpy().flatten())
+        iters += 1
+    return float(ranksum) / nranks, ap_scores / iters
+
 
 def control(queue, log, types, data, fout, distfn, nepochs, processes):
     min_rank = (np.Inf, -1)
@@ -65,7 +86,7 @@ def control(queue, log, types, data, fout, distfn, nepochs, processes):
                 'objects': data.objects,
             }, fout)
             # compute embedding quality
-            mrank, mAP = ranking(types, model, distfn)
+            mrank, mAP = eval_reconstruction(types, model, distfn)
             if mrank < min_rank[0]:
                 min_rank = (mrank, epoch)
             if mAP > max_map[0]:
