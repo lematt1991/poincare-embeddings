@@ -1,0 +1,10 @@
+name: poincare
+channels:
+- anaconda
+- pytorch
+- defaults
+dependencies:
+- python=3.6
+- nltk
+- scikit-learn
+- pytorch=0.4.1

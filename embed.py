@@ -1,188 +1,192 @@
 #!/usr/bin/env python3
-# Copyright (c) 2017-present, Facebook, Inc.
+# Copyright (c) 2018-present, Facebook, Inc.
 # All rights reserved.
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-#
+
 import torch as th
 import numpy as np
 import logging
 import argparse
-from torch.autograd import Variable
-from collections import defaultdict as ddict
-import torch.multiprocessing as mp
-import model, train, rsgd
-from data import slurp
-from rsgd import RiemannianSGD
-from sklearn.metrics import average_precision_score
-import gc
+from hype.sn import Embedding, initialize
+from hype.adjacency_matrix_dataset import AdjacencyDataset
+from hype import train
+from hype.graph import load_adjacency_matrix, load_edge_list, eval_reconstruction
+from hype.checkpoint import LocalCheckpoint
+from hype.rsgd import RiemannianSGD
+from hype.arsgd import RiemannianAveragedSGD
+from hype.common import log_bistro
 import sys
+import json
+
+th.manual_seed(42)
+np.random.seed(42)
 
 
-def ranking(types, model, distfn):
-    lt = th.from_numpy(model.embedding())
-    embedding = Variable(lt, volatile=True)
-    ranks = []
-    ap_scores = []
-    for s, s_types in types.items():
-        s_e = Variable(lt[s].expand_as(embedding), volatile=True)
-        _dists = model.dist()(s_e, embedding).data.cpu().numpy().flatten()
-        _dists[s] = 1e+12
-        _labels = np.zeros(embedding.size(0))
-        _dists_masked = _dists.copy()
-        _ranks = []
-        for o in s_types:
-            _dists_masked[o] = np.Inf
-            _labels[o] = 1
-        ap_scores.append(average_precision_score(_labels, -_dists))
-        for o in s_types:
-            d = _dists_masked.copy()
-            d[o] = _dists[o]
-            r = np.argsort(d)
-            _ranks.append(np.where(r == o)[0][0] + 1)
-        ranks += _ranks
-    return np.mean(ranks), np.mean(ap_scores)
-
-
-def control(queue, log, types, data, fout, distfn, nepochs, processes):
-    min_rank = (np.Inf, -1)
-    max_map = (0, -1)
-    while True:
-        gc.collect()
-        msg = queue.get()
-        if msg is None:
-            for p in processes:
-                p.terminate()
-            break
-        else:
-            epoch, elapsed, loss, model = msg
-        if model is not None:
-            # save model to fout
-            th.save({
-                'model': model.state_dict(),
-                'epoch': epoch,
-                'objects': data.objects,
-            }, fout)
-            # compute embedding quality
-            mrank, mAP = ranking(types, model, distfn)
-            if mrank < min_rank[0]:
-                min_rank = (mrank, epoch)
-            if mAP > max_map[0]:
-                max_map = (mAP, epoch)
-            log.info(
-                ('eval: {'
-                 '"epoch": %d, '
-                 '"elapsed": %.2f, '
-                 '"loss": %.3f, '
-                 '"mean_rank": %.2f, '
-                 '"mAP": %.4f, '
-                 '"best_rank": %.2f, '
-                 '"best_mAP": %.4f}') % (
-                     epoch, elapsed, loss, mrank, mAP, min_rank[0], max_map[0])
-            )
-        else:
-            log.info(f'json_log: {{"epoch": {epoch}, "loss": {loss}, "elapsed": {elapsed}}}')
-        if epoch >= nepochs - 1:
-            log.info(
-                ('results: {'
-                 '"mAP": %g, '
-                 '"mAP epoch": %d, '
-                 '"mean rank": %g, '
-                 '"mean rank epoch": %d'
-                 '}') % (
-                     max_map[0], max_map[1], min_rank[0], min_rank[1])
-            )
-            break
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train Poincare Embeddings')
-    parser.add_argument('-dim', help='Embedding dimension', type=int)
-    parser.add_argument('-dset', help='Dataset to embed', type=str)
-    parser.add_argument('-fout', help='Filename where to store model', type=str)
-    parser.add_argument('-distfn', help='Distance function', type=str)
-    parser.add_argument('-lr', help='Learning rate', type=float)
-    parser.add_argument('-epochs', help='Number of epochs', type=int, default=200)
-    parser.add_argument('-batchsize', help='Batchsize', type=int, default=50)
-    parser.add_argument('-negs', help='Number of negatives', type=int, default=20)
-    parser.add_argument('-nproc', help='Number of processes', type=int, default=5)
-    parser.add_argument('-ndproc', help='Number of data loading processes', type=int, default=2)
-    parser.add_argument('-eval_each', help='Run evaluation each n-th epoch', type=int, default=10)
-    parser.add_argument('-burnin', help='Duration of burn in', type=int, default=20)
-    parser.add_argument('-debug', help='Print debug output', action='store_true', default=False)
+if __name__ == '__main__':  # noqa C901
+    parser = argparse.ArgumentParser(description='Train Hyperbolic Embeddings')
+    parser.add_argument('-checkpoint', default='/tmp/hype_embeddings.pth',
+                        help='Where to store the model checkpoint')
+    parser.add_argument('-dset', type=str, required=True,
+                        help='Dataset identifier')
+    parser.add_argument('-dim', type=int, default=20,
+                        help='Embedding dimension')
+    parser.add_argument('-manifold', type=str, default='lorentz'
+                        , help='Embedding manifold')
+    parser.add_argument('-lr', type=float, default=1000,
+                        help='Learning rate')
+    parser.add_argument('-epochs', type=int, default=100,
+                        help='Number of epochs')
+    parser.add_argument('-batchsize', type=int, default=12800,
+                        help='Batchsize')
+    parser.add_argument('-negs', type=int, default=50,
+                        help='Number of negatives')
+    parser.add_argument('-burnin', type=int, default=20,
+                        help='Epochs of burn in')
+    parser.add_argument('-dampening', type=float, default=0.75,
+                        help='Sample dampening during burnin')
+    parser.add_argument('-ndproc', type=int, default=8,
+                        help='Number of data loading processes')
+    parser.add_argument('-eval_each', type=int, default=1,
+                        help='Run evaluation every n-th epoch')
+    parser.add_argument('-fresh', action='store_true', default=False,
+                        help='Override checkpoint')
+    parser.add_argument('-debug', action='store_true', default=False,
+                        help='Print debuggin output')
+    parser.add_argument('-gpu', default=0, type=int,
+                        help='Which GPU to run on (-1 for no gpu)')
+    parser.add_argument('-asgd', action='store_true', default=False,
+                        help='Train with Riemannian Averaged SGD')
+    parser.add_argument('-sym', action='store_true', default=False,
+                        help='Symmetrize dataset')
+    parser.add_argument('-maxnorm', default='500000', type=int)
+    parser.add_argument('-sparse', default=False, action='store_true',
+                        help='Use sparse gradients for embedding table')
+    parser.add_argument('-reconstruction', action='store_true',
+                        help='enable reconstruction evaluation')
+    parser.add_argument('-burnin_multiplier', default=0.01, type=float)
+    parser.add_argument('-neg_multiplier', default=1.0, type=float)
     opt = parser.parse_args()
 
-    th.set_default_tensor_type('torch.FloatTensor')
-    if opt.debug:
-        log_level = logging.DEBUG
-    else:
-        log_level = logging.INFO
-    log = logging.getLogger('poincare-nips17')
+    # set default tensor type
+    th.set_default_tensor_type('torch.DoubleTensor')
+    # set device
+    device = th.device(f'cuda:{opt.gpu}' if opt.gpu >= 0 else 'cpu')
+
+    # setup debugging and logigng
+    log_level = logging.DEBUG if opt.debug else logging.INFO
+    log = logging.getLogger('lorentz')
     logging.basicConfig(level=log_level, format='%(message)s', stream=sys.stdout)
-    idx, objects = slurp(opt.dset)
 
-    # create adjacency list for evaluation
-    adjacency = ddict(set)
-    for i in range(len(idx)):
-        s, o, _ = idx[i]
-        adjacency[s].add(o)
-    adjacency = dict(adjacency)
-
-    # setup Riemannian gradients for distances
-    opt.retraction = rsgd.euclidean_retraction
-    if opt.distfn == 'poincare':
-        distfn = model.PoincareDistance
-        opt.rgrad = rsgd.poincare_grad
-    elif opt.distfn == 'euclidean':
-        distfn = model.EuclideanDistance
-        opt.rgrad = rsgd.euclidean_grad
-    elif opt.distfn == 'transe':
-        distfn = model.TranseDistance
-        opt.rgrad = rsgd.euclidean_grad
+    # select manifold to optimize on
+    if opt.manifold == 'lorentz':
+        from hype import lorentz as manifold
+        opt.dim = opt.dim + 1
+    elif opt.manifold == 'poincare':
+        from hype import poincare as manifold
+    elif opt.manifold == 'euclidean':
+        from hype import euclidean as manifold
     else:
-        raise ValueError(f'Unknown distance function {opt.distfn}')
+        raise ValueError(f'Unknown manifold {opt.manifold}')
+    manifold.debug = opt.debug
 
-    # initialize model and data
-    model, data, model_name, conf = model.SNGraphDataset.initialize(distfn, opt, idx, objects)
+    if 'csv' in opt.dset:
+        log.info('Using edge list dataloader')
+        idx, objects, weights = load_edge_list(opt.dset, opt.sym)
+        model, data, model_name, conf = initialize(
+            manifold, opt, idx, objects, weights, sparse=opt.sparse
+        )
+    else:
+        log.info('Using adjacency matrix dataloader')
+        dset = load_adjacency_matrix(opt.dset, 'hdf5')
+        log.info('Setting up dataset...')
+        data = AdjacencyDataset(dset, opt.negs, opt.batchsize, opt.ndproc,
+            opt.burnin > 0)
+        model = Embedding(data.N, opt.dim, manifold, sparse=opt.sparse)
+        objects = dset['objects']
+
+    # set burnin parameters
+    data.neg_multiplier = opt.neg_multiplier
+    train._lr_multiplier = opt.burnin_multiplier
+
+    # setup optimizer
+    oparams = model.optim_params(manifold)
+    if opt.asgd:
+        model.w_avg = model.lt.weight.data.clone().to(device)
+        optimizer = RiemannianAveragedSGD(
+            oparams,
+            params_avg=[model.w_avg],
+            lr=opt.lr,
+            t0=2 * opt.burnin
+        )
+    else:
+        optimizer = RiemannianSGD(model.optim_params(manifold), lr=opt.lr)
 
     # Build config string for log
-    conf = [
-        ('distfn', '"{:s}"'),
-        ('dim', '{:d}'),
-        ('lr', '{:g}'),
-        ('batchsize', '{:d}'),
-        ('negs', '{:d}'),
-    ] + conf
-    conf = ', '.join(['"{}": {}'.format(k, f).format(getattr(opt, k)) for k, f in conf])
-    log.info(f'json_conf: {{{conf}}}')
+    log.info(f'json_conf: {json.dumps(vars(opt))}')
 
-    # initialize optimizer
-    optimizer = RiemannianSGD(
-        model.parameters(),
-        rgrad=opt.rgrad,
-        retraction=opt.retraction,
-        lr=opt.lr,
+    # setup checkpoint
+    checkpoint = LocalCheckpoint(
+        opt.checkpoint,
+        include_in_all={'conf' : vars(opt), 'objects' : objects},
+        start_fresh=opt.fresh
     )
 
-    # if nproc == 0, run single threaded, otherwise run Hogwild
-    if opt.nproc == 0:
-        train.train(model, data, optimizer, opt, log, 0)
-    else:
-        queue = mp.Manager().Queue()
-        model.share_memory()
-        processes = []
-        for rank in range(opt.nproc):
-            p = mp.Process(
-                target=train.train_mp,
-                args=(model, data, optimizer, opt, log, rank + 1, queue)
-            )
-            p.start()
-            processes.append(p)
+    # get state from checkpoint
+    state = checkpoint.initialize({'epoch': 0, 'model': model.state_dict()})
+    model.load_state_dict(state['model'])
+    opt.epoch_start = state['epoch']
 
-        ctrl = mp.Process(
-            target=control,
-            args=(queue, log, adjacency, data, opt.fout, distfn, opt.epochs, processes)
-        )
-        ctrl.start()
-        ctrl.join()
+    def checkpointer(model, epoch, loss):
+        lt = model.w_avg if hasattr(model, 'w_avg') else model.lt.weight.data
+        checkpoint.save({
+            'model': model.state_dict(),
+            'embeddings': lt.cpu().numpy(),
+            'epoch': epoch,
+            'manifold': manifold.__name__,
+        })
+
+    if opt.reconstruction:
+        adj = {}
+        for inputs, _ in data:
+            for row in inputs:
+                x = row[0].item()
+                y = row[1].item()
+                if x in adj:
+                    adj[x].add(y)
+                else:
+                    adj[x] = {y}
+
+    # control closure
+    def control(model, epoch, elapsed, loss):
+        """
+        Control thread to evaluate embedding
+        """
+        lt = model.w_avg if hasattr(model, 'w_avg') else model.lt.weight.data
+        sqnorms = manifold.pnorm(lt)
+        lmsg = {
+            'epoch': (epoch, 'd'),
+            'elapsed': (elapsed, '.2f'),
+            'loss': (loss, '.3f'),
+            'sqnorm_min': (sqnorms.min().item(), '.7f'),
+            'sqnorm_avg': (sqnorms.mean().item(), '.7f'),
+            'sqnorm_max': (sqnorms.max().item(), '.7f'),
+        }
+
+        if opt.reconstruction:
+            mean_rank, map_rank = eval_reconstruction(adj, lt, manifold.distance)
+            lmsg.update({
+                'mean_rank': (mean_rank, '.2f'),
+                'map_rank': (map_rank, '.2f'),
+            })
+
+        log_bistro(log, lmsg)
+
+    control.checkpoint = True
+    model = model.to(device)
+    if hasattr(model, 'w_avg'):
+        model.w_avg = model.w_avg.to(device)
+
+    train.train(device, model, data, optimizer, opt, log, ctrl=control,
+        checkpointer=checkpointer, progress=True)
