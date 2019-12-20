@@ -1,0 +1,20 @@
+{
+    "docs": {
+        "Examples": [
+            "examples/wordnet"
+        ],
+        "API": [
+            "api/hype/train",
+            "api/hype/common",
+            "api/hype/sn",
+            "api/hype/euclidean",
+            "api/hype/manifold",
+            "api/hype/checkpoint",
+            "api/hype/rsgd",
+            "api/hype/lorentz",
+            "api/hype/index",
+            "api/hype/poincare",
+            "api/hype/graph"
+        ]
+    }
+}
